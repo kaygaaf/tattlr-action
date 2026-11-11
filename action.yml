@@ -91,6 +91,12 @@ runs:
         [ "$os" = windows ] && ext=zip
         file="tattlr_${ver}_${os}_${arch}.${ext}"
         dir="$RUNNER_TEMP/tattlr-$ver"
+        if [ -x "$dir/tattlr" ] || [ -x "$dir/tattlr.exe" ]; then
+          # Already installed earlier in this job.
+          echo "$dir" >> "$GITHUB_PATH"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
         mkdir -p "$dir"
         cd "$dir"
         curl -fsSL --retry 3 -o "$file" "$repo/releases/download/v$ver/$file"
