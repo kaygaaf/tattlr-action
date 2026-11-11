@@ -1,0 +1,62 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: fixture
+        uses: ./
+        with:
+          path: test/home
+
+      - name: findings came through
+        shell: bash
+        env:
+          FINDINGS: ${{ steps.fixture.outputs.findings }}
+          CODE: ${{ steps.fixture.outputs.exit-code }}
+          SARIF: ${{ steps.fixture.outputs.sarif-file }}
+          VERSION: ${{ steps.fixture.outputs.version }}
+        run: |
+          echo "tattlr $VERSION, $FINDINGS findings, exit $CODE"
+          test "$FINDINGS" -gt 0
+          test "$CODE" = 0
+          grep -q '"version": "2.1.0"' "$SARIF"
+
+      - id: gate
+        uses: ./
+        continue-on-error: true
+        with:
+          path: test/home
+          fail-on: critical
+          summary: "false"
+
+      - name: fail-on fails the step
+        shell: bash
+        run: test "${{ steps.gate.outcome }}" = failure
+
+      - id: empty
+        uses: ./
+        with:
+          path: test/nothing-here
+          fail-on: low
+          summary: "false"
+
+      - name: no logs is not an error
+        shell: bash
+        run: test "${{ steps.empty.outputs.findings }}" = 0

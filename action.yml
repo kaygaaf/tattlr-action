@@ -1,0 +1,178 @@
+name: tattlr scan
+description: Check what Claude Code, Codex, Gemini CLI, OpenClaw or Cursor did in your job. Fails on risky tool calls, writes SARIF.
+author: Kayorama
+branding:
+  icon: eye
+  color: red
+
+inputs:
+  version:
+    description: tattlr version to install, like 0.2.0. "latest" picks the newest release. Needs 0.2.0 or newer.
+    default: latest
+  path:
+    description: Home folder to look for agent logs in. Defaults to the runner's home, which is where agents write their sessions.
+    default: ""
+  since:
+    description: Only look at activity after this, like 2h, 1d or 2026-10-01.
+    default: ""
+  agent:
+    description: Only these agents, comma separated (claude, codex, gemini, openclaw, cursor).
+    default: ""
+  project:
+    description: Only sessions whose project path contains this.
+    default: ""
+  fail-on:
+    description: Fail the step when anything at or above this severity shows up (low, medium, high, critical). Empty never fails.
+    default: ""
+  format:
+    description: What goes to the job log (text, json, sarif or markdown).
+    default: text
+  summary:
+    description: Add the rap sheet to the job summary.
+    default: "true"
+  sarif-file:
+    description: Where to write the SARIF report. Defaults to tattlr.sarif in the runner temp folder.
+    default: ""
+  upload-sarif:
+    description: Upload the SARIF report to GitHub code scanning. The job needs "security-events write" permission.
+    default: "false"
+  category:
+    description: Code scanning category, so several tattlr runs in one repo don't overwrite each other.
+    default: tattlr
+
+outputs:
+  findings:
+    description: Number of findings.
+    value: ${{ steps.scan.outputs.findings }}
+  exit-code:
+    description: tattlr's exit code. 1 means something hit the fail-on severity.
+    value: ${{ steps.scan.outputs.exit-code }}
+  sarif-file:
+    description: Path to the SARIF report.
+    value: ${{ steps.scan.outputs.sarif-file }}
+  version:
+    description: The tattlr version that ran.
+    value: ${{ steps.install.outputs.version }}
+
+runs:
+  using: composite
+  steps:
+    - id: install
+      shell: bash
+      env:
+        TATTLR_VERSION: ${{ inputs.version }}
+      run: |
+        # Download the release archive and check it against checksums.txt.
+        set -euo pipefail
+        repo=https://github.com/kaygaaf/tattlr
+        case "$RUNNER_OS" in
+          Linux) os=linux ;;
+          macOS) os=darwin ;;
+          Windows) os=windows ;;
+          *) echo "::error::tattlr has no build for $RUNNER_OS"; exit 1 ;;
+        esac
+        case "$RUNNER_ARCH" in
+          X64) arch=amd64 ;;
+          ARM64) arch=arm64 ;;
+          *) echo "::error::tattlr has no build for $RUNNER_ARCH"; exit 1 ;;
+        esac
+        ver="${TATTLR_VERSION#v}"
+        if [ -z "$ver" ] || [ "$ver" = latest ]; then
+          # The latest release page redirects to /tag/vX.Y.Z. No API call,
+          # so no rate limit.
+          url=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$repo/releases/latest")
+          ver="${url##*/v}"
+        fi
+        case "$ver" in
+          [0-9]*.[0-9]*.[0-9]*) ;;
+          *) echo "::error::can't make sense of tattlr version '$ver'"; exit 1 ;;
+        esac
+        ext=tar.gz
+        [ "$os" = windows ] && ext=zip
+        file="tattlr_${ver}_${os}_${arch}.${ext}"
+        dir="$RUNNER_TEMP/tattlr-$ver"
+        mkdir -p "$dir"
+        cd "$dir"
+        curl -fsSL --retry 3 -o "$file" "$repo/releases/download/v$ver/$file"
+        curl -fsSL --retry 3 -o checksums.txt "$repo/releases/download/v$ver/checksums.txt"
+        want=$(awk -v f="$file" '$2 == f { print $1 }' checksums.txt)
+        if [ -z "$want" ]; then
+          echo "::error::$file is not in checksums.txt"; exit 1
+        fi
+        if command -v sha256sum >/dev/null; then
+          got=$(sha256sum "$file" | awk '{print $1}')
+        else
+          got=$(shasum -a 256 "$file" | awk '{print $1}')
+        fi
+        if [ "$got" != "$want" ]; then
+          echo "::error::checksum mismatch for $file (got $got, want $want)"; exit 1
+        fi
+        if [ "$ext" = tar.gz ]; then
+          tar -xzf "$file"
+        elif command -v unzip >/dev/null; then
+          unzip -oq "$file"
+        else
+          7z x -y "$file" >/dev/null
+        fi
+        rm -f "$file"
+        echo "$dir" >> "$GITHUB_PATH"
+        echo "version=$ver" >> "$GITHUB_OUTPUT"
+        echo "tattlr $ver installed, sha256 $got"
+
+    - id: scan
+      shell: bash
+      env:
+        IN_PATH: ${{ inputs.path }}
+        IN_SINCE: ${{ inputs.since }}
+        IN_AGENT: ${{ inputs.agent }}
+        IN_PROJECT: ${{ inputs.project }}
+        IN_FAIL_ON: ${{ inputs.fail-on }}
+        IN_FORMAT: ${{ inputs.format }}
+        IN_SUMMARY: ${{ inputs.summary }}
+        IN_SARIF: ${{ inputs.sarif-file }}
+      run: |
+        set -uo pipefail
+        args=(scan)
+        home="${IN_PATH:-$HOME}"
+        if command -v cygpath >/dev/null; then home=$(cygpath -w "$home"); fi
+        args+=(--home "$home")
+        [ -n "$IN_SINCE" ] && args+=(--since "$IN_SINCE")
+        [ -n "$IN_AGENT" ] && args+=(--agent "$IN_AGENT")
+        [ -n "$IN_PROJECT" ] && args+=(--project "$IN_PROJECT")
+        sarif="${IN_SARIF:-$RUNNER_TEMP/tattlr.sarif}"
+
+        if ! tattlr "${args[@]}" --format sarif > "$sarif"; then
+          echo "::error::tattlr scan failed, see above"; exit 1
+        fi
+        findings=$(grep -c '"ruleId"' "$sarif" || true)
+
+        fail=()
+        [ -n "$IN_FAIL_ON" ] && fail=(--fail-on "$IN_FAIL_ON")
+        FORCE_COLOR=1 tattlr "${args[@]}" --format "$IN_FORMAT" ${fail[@]+"${fail[@]}"}
+        code=$?
+        if [ "$code" -ne 0 ] && { [ "$code" -ne 1 ] || [ -z "$IN_FAIL_ON" ]; }; then
+          echo "::error::tattlr exited with $code"; exit "$code"
+        fi
+        if [ "$IN_SUMMARY" = true ]; then
+          tattlr "${args[@]}" --format markdown >> "$GITHUB_STEP_SUMMARY"
+        fi
+        {
+          echo "findings=$findings"
+          echo "exit-code=$code"
+          echo "sarif-file=$sarif"
+        } >> "$GITHUB_OUTPUT"
+
+    - if: inputs.upload-sarif == 'true'
+      uses: github/codeql-action/upload-sarif@v4
+      with:
+        sarif_file: ${{ steps.scan.outputs.sarif-file }}
+        category: ${{ inputs.category }}
+
+    - if: steps.scan.outputs.exit-code == '1'
+      shell: bash
+      env:
+        IN_FAIL_ON: ${{ inputs.fail-on }}
+        FINDINGS: ${{ steps.scan.outputs.findings }}
+      run: |
+        echo "::error title=tattlr::an agent did something rated $IN_FAIL_ON or worse ($FINDINGS findings in total). The rap sheet is in the log and the job summary."
+        exit 1
